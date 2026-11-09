@@ -368,3 +368,55 @@ def test_mask_preserves_unitree_routing_args():
     assert masked["service_name"] == "loco"
     assert masked["operation_name"] == "SetFsmId"
     assert "topsecret" not in json.dumps(masked)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# regression: VP nonce-replay (a presentation is single-use) + error meta
+# ─────────────────────────────────────────────────────────────────────────
+class _RaisingClient:
+    def build_presentation(self, *a, **k):
+        raise RuntimeError("present down")
+
+
+def test_probe_mints_fresh_presentation_per_probe(monkeypatch):
+    """Each probe must carry a NEW presentation (anti-replay nonce)."""
+    monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
+    gate = _fake_gate(decision={"decision": "allow", "decision_id": "d-1"})
+    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
+    fake = FakeClient()
+    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: fake)
+    agentspp_authz._artifacts["shell"] = {
+        "session": "s", "agent_did": "a", "vc": "v", "vp": "stale", "capabilities": "c",
+    }
+    agentspp_authz.probe("g1_turn", {}, "shell", blocking=True)
+    agentspp_authz.probe("g1_turn", {}, "shell", blocking=True)
+    # gate saw the freshly minted presentation both times, never the stale one
+    assert all(c["vp"] == "vp.jwt" for c in gate.calls)
+    assert fake.pres == 2
+
+
+def test_probe_falls_back_to_bootstrap_vp_when_present_fails(monkeypatch):
+    monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
+    gate = _fake_gate(decision={"decision": "allow", "decision_id": "d-2"})
+    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
+    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: _RaisingClient())
+    agentspp_authz._artifacts["shell"] = {
+        "session": "s", "agent_did": "a", "vc": "v", "vp": "bootstrap-vp", "capabilities": "c",
+    }
+    meta = agentspp_authz.probe("g1_turn", {}, "shell", blocking=True)
+    assert meta["decision"] == "allow"
+    assert gate.calls[0]["vp"] == "bootstrap-vp"
+
+
+def test_probe_captures_full_gate_error_message(monkeypatch):
+    """Gate exceptions surface as {'message': ...} — must not be dropped."""
+    monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
+    gate = _fake_gate(error={"message": "Agents++ request failed with status 400"})
+    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
+    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: FakeClient())
+    agentspp_authz._artifacts["shell"] = {
+        "session": "s", "agent_did": "a", "vc": "v", "vp": "stale", "capabilities": "c",
+    }
+    meta = agentspp_authz.probe("g1_turn", {}, "shell", blocking=True)
+    assert meta["decision"] is None
+    assert meta["error"] == {"message": "Agents++ request failed with status 400"}

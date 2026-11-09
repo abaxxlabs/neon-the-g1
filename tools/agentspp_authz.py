@@ -244,32 +244,48 @@ def _probe_sync(
         meta["reason"] = "artifacts unavailable"
     else:
         pkg = _load_package()
+        # A presentation is single-use (anti-replay nonce is consumed by the
+        # first decide that carries it), so every probe mints a fresh one
+        # from the cached VC. Only on a present failure do we fall back to a
+        # bootstrap-time presentation (test doubles / degraded shadow).
+        vp = None
+        present_error = None
         try:
-            res = pkg.run_authorization_gate(
-                pkg.default_client(),
-                mode,
-                session=artifacts["session"],
-                agent_did=artifacts["agent_did"],
-                persona=persona,
-                channel=persona,
-                tool=tool_name,
-                operation=tool_name,
-                vc=artifacts["vc"],
-                vp=artifacts["vp"],
-                capability=capability,
-                context={"args": dict(args) if isinstance(args, Mapping) else args},
+            pres = pkg.default_client().build_presentation(
+                artifacts["session"], artifacts["agent_did"], artifacts["vc"]
             )
-            decision = res.decision or {}
-            meta["decision"] = decision.get("decision")
-            meta["decision_id"] = decision.get("decision_id")
-            meta["reason"] = decision.get("reason") or res.reason
-            meta["error"] = (
-                {"status": res.error.get("status"), "error": res.error.get("error")}
-                if res.error
-                else None
-            )
-        except Exception as e:  # the gate contract is never-raise; belt & braces
-            meta["reason"] = f"gate error: {e!r}"
+            vp = pres["presentation"] if isinstance(pres, Mapping) else pres
+        except Exception as e:
+            present_error = e
+        if vp is None:
+            vp = artifacts.get("vp")
+        if vp is None:
+            meta["error"] = {"message": f"presentation failed: {present_error!r}"}
+        else:
+            try:
+                res = pkg.run_authorization_gate(
+                    pkg.default_client(),
+                    mode,
+                    session=artifacts["session"],
+                    agent_did=artifacts["agent_did"],
+                    persona=persona,
+                    channel=persona,
+                    tool=tool_name,
+                    operation=tool_name,
+                    vc=artifacts["vc"],
+                    vp=vp,
+                    capability=capability,
+                    context={"args": dict(args) if isinstance(args, Mapping) else args},
+                )
+                decision = res.decision or {}
+                meta["decision"] = decision.get("decision")
+                meta["decision_id"] = decision.get("decision_id")
+                meta["reason"] = decision.get("reason") or res.reason
+                # Capture the whole error mapping — the gate may carry a
+                # {"message": ...} shape that has no status/error keys.
+                meta["error"] = dict(res.error) if res.error else None
+            except Exception as e:  # the gate contract is never-raise; belt & braces
+                meta["reason"] = f"gate error: {e!r}"
 
     verdict = meta["decision"] or ("ERROR" if meta["error"] or meta["reason"] == "artifacts unavailable" else "UNKNOWN")
     line = (
