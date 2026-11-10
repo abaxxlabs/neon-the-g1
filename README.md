@@ -129,13 +129,22 @@ make help                         # every target
 
 [The eight gates](https://cagataycali.github.io/neon-the-g1/guide/safety/).
 
-## authorization (Agents++ shadow probe)
+## authorization (Agents++ probe / enforcement)
 
-Optional telemetry layer (ABXAGNTS-911): before mapped high-risk operations
+Optional policy layer (ABXAGNTS-911/912): before mapped high-risk operations
 (locomotion, FSM change, raw DDS publish, arm gestures) execute, NEON asks an
 [Agents++](https://github.com/abaxxlabs/agentspp-strands-tools) instance
 `/authorization/decide` and logs the ALLOW/DENY + `decision_id` to the journal
-and the Activity Log (role `authz`). **Shadow mode never blocks a tool.**
+and the Activity Log (role `authz`).
+
+- `shadow` — the decision is telemetry only; **never blocks a tool**.
+- `enforce` (912) — for the enforcement set (`robot.motion.walk`,
+  `robot.control.fsm.change`, `robot.dds.publish.raw`) the probe runs
+  synchronously and **gates execution**: allow runs the tool; deny, error or
+  an unavailable Agents++ instance means the tool never runs (fail closed),
+  and the caller/persona gets an explicit deny reason. `robot.motion.stop` is
+  deliberately not enforced — enforcement must never block stopping the robot.
+  All other mapped capabilities stay shadow in `enforce` mode too.
 
 ```bash
 pip install -e .[agentspp]   # or: pip install -e /path/to/agentspp-strands-tools
@@ -149,7 +158,8 @@ export NEON_AUTHZ_VC_CAPABILITIES=robot.motion.walk,robot.dds.publish.raw
 
 The probe is a no-op (zero overhead) unless `NEON_AUTHZ_MODE` is set and the
 operation is mapped in `tools/agentspp_authz.py` — add a row there to grow the
-enforcement scope in later phases.
+capability map; add the capability to `ENFORCED_CAPABILITIES` to gate it in
+`enforce` mode (ABXAGNTS-913 expands the set).
 
 ## MCP server
 

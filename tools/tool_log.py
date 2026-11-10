@@ -109,6 +109,48 @@ def summarize_result(result: Any) -> Dict[str, Any]:
     return out
 
 
+def _deny_result(reason: str, decision_id: Optional[str] = None) -> Dict[str, Any]:
+    """Deny payload for a gated operation (falls back if the helper is broken)."""
+    try:
+        from . import agentspp_authz
+        return agentspp_authz.deny_payload(reason, decision_id)
+    except Exception:
+        return {
+            "status": "error",
+            "content": [{"text": f"DENIED by authorization policy: {reason}"}],
+        }
+
+
+def _gate_bug_deny(authz_mod: Any, name: str, args: Any, e: Exception) -> Optional[Dict[str, Any]]:
+    """A bug INSIDE the gate: fail closed for enforced calls, never for others."""
+    try:
+        if authz_mod.enforcement_active(name, args):
+            return _deny_result(f"authorization service error: {e!r}", None)
+    except Exception:
+        # enforcement_active itself failed: still fail closed if the mode
+        # reads enforce — better a false deny than an ungated enforced call.
+        try:
+            if authz_mod.authz_mode() == "enforce":
+                return _deny_result(f"authorization service error: {e!r}", None)
+        except Exception:
+            pass
+    return None
+
+
+def _wrap_result_event(result: Dict[str, Any], tool_use_id: Optional[str]) -> Any:
+    """Wrap a plain ToolResult dict in the strands ToolResultEvent the
+    executor expects as the final stream event (the documented way to
+    short-circuit/deny a tool call). Falls back to the plain dict."""
+    try:
+        from strands.types._events import ToolResultEvent
+        return ToolResultEvent({**result, "toolUseId": tool_use_id or "unknown"})
+    except Exception:
+        out = dict(result)
+        if tool_use_id:
+            out["toolUseId"] = tool_use_id
+        return out
+
+
 class LoggedTool(AgentTool):
     """An ``AgentTool`` that logs every call of the tool it wraps."""
 
@@ -149,21 +191,35 @@ class LoggedTool(AgentTool):
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Direct calls (``g1_get_state(network_interface=...)``) still work."""
-        self._authz_probe(self.tool_name, kwargs)
+        denial = self._authz_gate(self.tool_name, kwargs)
+        if denial is not None:
+            return denial
         return self._inner(*args, **kwargs)  # type: ignore[operator]
 
-    def _authz_probe(self, name: str, args: Any, tool_use_id: Optional[str] = None) -> None:
-        """Shadow authorization probe (ABXAGNTS-911).
+    def _authz_gate(self, name: str, args: Any, tool_use_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Authorization gate (ABXAGNTS-911 shadow / 912 enforcement).
 
-        No-op unless NEON_AUTHZ_MODE is shadow/enforce and the operation is
-        mapped to a capability. Must never raise: the authz path must not
-        take a tool path down.
+        Returns a deny payload (Strands ToolResult dict) when the
+        operation must NOT run, or None to proceed.
+
+        Must never raise: for non-enforced calls any internal error is
+        swallowed (shadow invariant — authz never takes a tool path
+        down); for ENFORCED calls it fails closed with a generic deny.
         """
+        from . import agentspp_authz
         try:
-            from . import agentspp_authz
-            agentspp_authz.probe(name, args, self._persona, tool_use_id=tool_use_id)
-        except Exception:
-            pass
+            meta = agentspp_authz.probe(name, args, self._persona, tool_use_id=tool_use_id)
+        except Exception as e:
+            return _gate_bug_deny(agentspp_authz, name, args, e)
+        if meta is None:
+            return None
+        try:
+            verdict, reason = agentspp_authz.enforcement_verdict(meta)
+        except Exception as e:
+            return _gate_bug_deny(agentspp_authz, name, args, e)
+        if verdict == "allow":
+            return None
+        return _deny_result(reason, meta.get("decision_id"))
 
     def __getattr__(self, name: str) -> Any:
         # Anything else (original_function, _metadata, ...) comes from the inner tool.
@@ -174,8 +230,16 @@ class LoggedTool(AgentTool):
         name = self.tool_name
         args = _mask((tool_use or {}).get("input"))
         tid = (tool_use or {}).get("toolUseId")
-        self._authz_probe(name, args, tid)
         t0 = time.monotonic()
+        denial = self._authz_gate(name, args, tid)
+        if denial is not None:
+            # The operation never reaches the inner tool (hardware untouched).
+            text = denial["content"][0]["text"] if denial.get("content") else "denied"
+            log_call(self._persona, name, args, time.monotonic() - t0,
+                     {"status": "denied", "rc": None, "message": _short(text), "moved": None},
+                     tool_use_id=tid)
+            yield _wrap_result_event(denial, tid)
+            return
         last: Any = None
         logged = False
         try:
