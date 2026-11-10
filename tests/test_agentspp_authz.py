@@ -176,9 +176,11 @@ def test_bootstrap_provisions_and_caches(monkeypatch):
     assert art["agent_did"] == "did:agents:neon-voice"
     assert art["vc"] == "vc.jwt"
     assert art["vp"] == "vp.jwt"
-    # all mapped capabilities granted by default
+    # ABXAGNTS-913: persona matrix — voice (slim toolset) gets its own caps
     assert "robot.motion.walk" in art["capabilities"]
-    assert "robot.dds.publish.raw" in art["capabilities"]
+    assert "robot.arm.gesture" in art["capabilities"]
+    assert "robot.dds.publish.raw" not in art["capabilities"]  # no g1_dds in slim set
+    assert "robot.control.sdk.rpc" not in art["capabilities"]  # no use_unitree
     # cached: a second provision is free
     agentspp_authz._get_artifacts("voice")
     assert fake.agents == 1 and fake.creds == 1 and fake.pres == 1

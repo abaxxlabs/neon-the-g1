@@ -195,9 +195,11 @@ def test_denied_cap_is_not_stop():
     # robot.motion.stop must stay out of the enforcement set: enforcement
     # must never be able to prevent stopping the robot.
     assert "robot.motion.stop" not in agentspp_authz.ENFORCED_CAPABILITIES
+    # 913: the full body-movement set is enforced; arms/stop/sdk.rpc stay shadow
     assert {
         "robot.motion.walk",
         "robot.control.fsm.change",
+        "robot.control.zerotorque",
         "robot.dds.publish.raw",
     } == set(agentspp_authz.ENFORCED_CAPABILITIES)
 

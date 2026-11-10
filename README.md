@@ -131,20 +131,31 @@ make help                         # every target
 
 ## authorization (Agents++ probe / enforcement)
 
-Optional policy layer (ABXAGNTS-911/912): before mapped high-risk operations
-(locomotion, FSM change, raw DDS publish, arm gestures) execute, NEON asks an
+Optional policy layer (ABXAGNTS-911/912/913): before mapped high-risk
+operations (locomotion, FSM change, ZeroTorque, raw DDS publish, arm gestures,
+and any other mutative SDK RPC) execute, NEON asks an
 [Agents++](https://github.com/abaxxlabs/agentspp-strands-tools) instance
 `/authorization/decide` and logs the ALLOW/DENY + `decision_id` to the journal
 and the Activity Log (role `authz`).
 
 - `shadow` — the decision is telemetry only; **never blocks a tool**.
-- `enforce` (912) — for the enforcement set (`robot.motion.walk`,
-  `robot.control.fsm.change`, `robot.dds.publish.raw`) the probe runs
-  synchronously and **gates execution**: allow runs the tool; deny, error or
-  an unavailable Agents++ instance means the tool never runs (fail closed),
-  and the caller/persona gets an explicit deny reason. `robot.motion.stop` is
-  deliberately not enforced — enforcement must never block stopping the robot.
-  All other mapped capabilities stay shadow in `enforce` mode too.
+- `enforce` (912/913) — for the enforcement set (`robot.motion.walk`,
+  `robot.control.fsm.change`, `robot.control.zerotorque`,
+  `robot.dds.publish.raw`) the probe runs synchronously and **gates
+  execution**: allow runs the tool; deny, error or an unavailable Agents++
+  instance means the tool never runs (fail closed), with an explicit deny
+  reason. `robot.motion.stop` is deliberately not enforced — enforcement must
+  never block stopping the robot. Arms and the generic `robot.control.sdk.rpc`
+  fallback stay shadow (audited, not blocking).
+
+**Policy lives in the credential (913).** Each persona bootstraps a VC that
+carries only the capabilities in `PERSONA_CAPABILITY_MATRIX` — a faithful
+extraction of NEON's pre-existing gates: local/telegram/thinker get the full
+set, the slim voice/dashboard toolsets get walk+stop+arm, and the remote MCP
+client cannot walk the robot (its `--safe` intent, which previously left the
+`use_unitree` hammer open, is now sealed at the credential level). Every robot
+mutation resolves to a capability, so no SDK RPC escapes the layer; reads stay
+unmapped. Unknown personas get a zero-capability VC (zero trust).
 
 ```bash
 pip install -e .[agentspp]   # or: pip install -e /path/to/agentspp-strands-tools
@@ -157,9 +168,10 @@ export NEON_AUTHZ_VC_CAPABILITIES=robot.motion.walk,robot.dds.publish.raw
 ```
 
 The probe is a no-op (zero overhead) unless `NEON_AUTHZ_MODE` is set and the
-operation is mapped in `tools/agentspp_authz.py` — add a row there to grow the
-capability map; add the capability to `ENFORCED_CAPABILITIES` to gate it in
-`enforce` mode (ABXAGNTS-913 expands the set).
+operation is mapped in `tools/agentspp_authz.py` — add a row (or a
+`(service, operation)` pair) there to map a new operation; add the
+capability to `ENFORCED_CAPABILITIES` to gate it in `enforce` mode; add the
+persona to `PERSONA_CAPABILITY_MATRIX` to grant it capabilities.
 
 ## MCP server
 

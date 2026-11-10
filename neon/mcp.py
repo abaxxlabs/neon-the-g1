@@ -97,6 +97,10 @@ def main() -> None:
     tools = build_tools(
         include_telegram=not args.no_telegram,
         include_robot=not args.no_robot,
+        # ABXAGNTS-913: a remote MCP client is its own persona — journal and
+        # Agents++ capability matrix key off it (it used to inherit "shell",
+        # the local operator's identity).
+        persona="mcp",
     )
 
     # --safe: strip the 🔴 locomotion tools so a remote client can't walk the robot.

@@ -32,8 +32,18 @@ Other env vars:
     AGENTSPP_BEARER_TOKEN        production OIDC token for the session
     NEON_AUTHZ_HUMAN_DID         mock human DID in dev (default did:web:neon-dev)
     NEON_AUTHZ_VC_CAPABILITIES   comma-separated capability subset to issue in
-                                 the VC (default: all of ALL_CAPABILITIES).
-                                 Narrow it to observe DENY outcomes in shadow.
+                                 the VC — OVERRIDES the persona matrix (dev
+                                 knob to observe DENY outcomes).
+
+ABXAGNTS-913 (persona matrix)
+    The VC each persona bootstraps carries only the capabilities in
+    ``PERSONA_CAPABILITY_MATRIX`` — policy lives in the credential, decided
+    server-side by /authorization/decide. The matrix is a faithful extraction
+    of NEON's pre-existing hardcoded gates (docs/guide/safety.md, neon-mcp
+    --safe, slim voice toolsets); it invents no new restrictions. Unknown
+    personas get a zero-capability VC (zero trust). Every robot MUTATION now
+    resolves to a capability (the use_unitree hammer's unlisted mutative RPCs
+    fall back to ``robot.control.sdk.rpc``); only reads stay unmapped.
 """
 from __future__ import annotations
 
@@ -56,6 +66,9 @@ NEON_OPERATION_CAPABILITY_MAP: Dict[str, str] = {
     "g1_turn": "robot.motion.walk",
     "g1_wave_hand_loco": "robot.motion.walk",
     "g1_shake_hand_loco": "robot.motion.walk",
+    # ABXAGNTS-913: raw locomotion-task dispatch is leg motion — it must go
+    # through the same capability as walking (it bypassed the 912 gate).
+    "g1_set_task_id": "robot.motion.walk",
     "g1_stop_move": "robot.motion.stop",
     # arm (tools/g1_arm.py)
     "g1_arm_action": "robot.arm.gesture",
@@ -72,11 +85,44 @@ _USE_UNITREE_OPS: Dict[tuple, str] = {
     ("loco", "WaveHand"): "robot.motion.walk",
     ("loco", "ShakeHand"): "robot.motion.walk",
     ("loco", "StopMove"): "robot.motion.stop",
+    # ABXAGNTS-913: the collapse op gets its own auditable capability
+    # (today it only produced a warning, no decision).
+    ("loco", "ZeroTorque"): "robot.control.zerotorque",
     ("motion_switcher", "ReleaseMode"): "robot.control.fsm.change",
 }
 
+# ABXAGNTS-913: the hammer can reach ANY SDK RPC; the listed ops above get
+# specific capabilities, every OTHER mutative RPC falls back to this one so
+# no robot mutation escapes the permission layer. Read-only ops (Get*/Check*/
+# whitelist) stay unmapped — there is no robot policy about reads.
+SDK_RPC_FALLBACK_CAPABILITY = "robot.control.sdk.rpc"
+
+# Mirrors tools/use_unitree.py (MUTATIVE_PREFIXES / READONLY_WHITELIST).
+# Kept local so the authz path has no import dependency on the SDK hammer;
+# if the source lists change, change these too.
+_MUTATIVE_PREFIXES = (
+    "Set", "Execute", "Move", "Start", "Stop", "Damp",
+    "Sit", "HighStand", "LowStand", "WaveHand", "ShakeHand",
+    "Squat2StandUp", "Lie2StandUp", "StandUp2Squat",
+    "BalanceStand", "ZeroTorque",
+    "LedControl", "TtsMaker", "PlayStream", "PlayStop",
+    "SelectMode", "ReleaseMode",
+)
+_READONLY_WHITELIST = {
+    "CheckMode", "GetActionList", "GetVolume", "GetBrightness", "GetSwitch",
+    "Init",  # idempotent singleton init
+}
+
+
+def _unitree_op_is_mutative(operation_name: str) -> bool:
+    if operation_name in _READONLY_WHITELIST:
+        return False
+    return any(operation_name.startswith(p) for p in _MUTATIVE_PREFIXES)
+
 ALL_CAPABILITIES: List[str] = sorted(
-    set(NEON_OPERATION_CAPABILITY_MAP.values()) | set(_USE_UNITREE_OPS.values())
+    set(NEON_OPERATION_CAPABILITY_MAP.values())
+    | set(_USE_UNITREE_OPS.values())
+    | {SDK_RPC_FALLBACK_CAPABILITY}
 )
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -86,13 +132,18 @@ ALL_CAPABILITIES: List[str] = sorted(
 #   allow            -> the tool runs
 #   deny             -> the tool NEVER runs, explicit reason returned
 #   error/unavailable-> fail closed (same as deny)
-# Every other mapped capability stays shadow (async probe, log only).
-# NOTE: robot.motion.stop is deliberately NOT enforced — enforcement must
-# never be able to prevent stopping the robot. ABXAGNTS-913 grows this set.
+# Every other mapped capability stays shadow (async probe, log only):
+#   robot.arm.gesture   — no permission policy exists today (only the mutex)
+#   robot.motion.stop   — enforcement must never prevent stopping the robot
+#   robot.control.sdk.rpc — the hammer's mutative fallback; flagged today,
+#                           audited (shadow) here, not blocked
+# ABXAGNTS-913 added zerotorque (was an unprobed hole) and the sdk.rpc
+# fallback; the set grows here.
 # ─────────────────────────────────────────────────────────────────────────
 ENFORCED_CAPABILITIES = frozenset({
     "robot.motion.walk",
     "robot.control.fsm.change",
+    "robot.control.zerotorque",
     "robot.dds.publish.raw",
 })
 
@@ -122,7 +173,62 @@ def resolve_neon_capability(
         key = (str(args.get("service_name", "")), str(args.get("operation_name", "")))
         if key in _USE_UNITREE_OPS:
             return _USE_UNITREE_OPS[key]
+        # ABXAGNTS-913: unlisted mutative RPCs fall back to the generic
+        # hammer capability so no mutation escapes the permission layer.
+        if _unitree_op_is_mutative(key[1]):
+            return SDK_RPC_FALLBACK_CAPABILITY
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ABXAGNTS-913: persona x capability matrix.
+# Policy = the credential. Each persona's VC carries only the capabilities
+# its channel's EXISTING toolset/policy allows (faithful extraction of the
+# hardcoded gates — docs/guide/safety.md, neon-mcp --safe, slim toolsets):
+#   - shell/telegram/thinker: full toolset (G1_ALL_TOOLS) -> every capability.
+#     Telegram's human allowlist (gate 1) is identity, not capability, and
+#     stays where it is.
+#   - voice/dashboard: slim toolset (no use_unitree, no g1_dds_publish).
+#   - mcp: remote client. Documented --safe default is "state/arms/audio/
+#     sensing only" — it cannot walk the robot. The flag only filtered
+#     locomotion tools by name and left use_unitree in place; the
+#     credential-level denial below seals that bypass (walk/fsm/zerotorque/
+#     sdk.rpc all resolve to capabilities the mcp VC does not carry).
+# Unknown personas get a ZERO-capability VC (zero trust): enforced calls
+# deny, shadow calls log deny, nothing is silently granted.
+# ─────────────────────────────────────────────────────────────────────────
+_ALL_CPS = {
+    "walk": "robot.motion.walk",
+    "stop": "robot.motion.stop",
+    "arm": "robot.arm.gesture",
+    "fsm": "robot.control.fsm.change",
+    "ztq": "robot.control.zerotorque",
+    "dds": "robot.dds.publish.raw",
+    "rpc": "robot.control.sdk.rpc",
+}
+
+PERSONA_CAPABILITY_MATRIX: Dict[str, List[str]] = {
+    "shell":    [_ALL_CPS[k] for k in ("walk", "stop", "arm", "fsm", "ztq", "dds", "rpc")],
+    "telegram": [_ALL_CPS[k] for k in ("walk", "stop", "arm", "fsm", "ztq", "dds", "rpc")],
+    "thinker":  [_ALL_CPS[k] for k in ("walk", "stop", "arm", "fsm", "ztq", "dds", "rpc")],
+    "voice":    [_ALL_CPS[k] for k in ("walk", "stop", "arm")],
+    "dashboard": [_ALL_CPS[k] for k in ("walk", "stop", "arm")],
+    "mcp":      [_ALL_CPS[k] for k in ("stop", "arm", "dds")],
+}
+
+
+def persona_caps(persona: str) -> List[str]:
+    """Capabilities to issue in this persona's VC (see matrix above)."""
+    caps = PERSONA_CAPABILITY_MATRIX.get(persona)
+    if caps is None:
+        _notice_once(
+            f"persona:{persona}",
+            f"unknown persona '{persona}' for the Agents++ capability matrix — "
+            f"issuing a zero-capability VC (zero trust). Add it to "
+            f"PERSONA_CAPABILITY_MATRIX to grant capabilities.",
+        )
+        return []
+    return list(caps)
 
 
 _VALID_MODES = ("off", "shadow", "enforce")
@@ -203,7 +309,7 @@ def _get_artifacts(persona: str) -> Optional[Dict[str, Any]]:
         caps = (
             [c.strip() for c in caps_env.split(",") if c.strip()]
             if caps_env
-            else list(ALL_CAPABILITIES)
+            else persona_caps(persona)
         )
         vc = client.issue_credential(
             session, agent_did, profile="capability",
