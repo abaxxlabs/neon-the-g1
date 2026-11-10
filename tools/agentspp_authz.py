@@ -20,8 +20,12 @@ What this is NOT
 Modes — ``NEON_AUTHZ_MODE`` env, default ``off`` (behavioral baseline):
     off      no Agents++ calls, zero overhead
     shadow   probe mapped operations, log the decision, never block
-    enforce  foundation phase: identical to shadow + explicit DENY marker
-             (blocking is deferred to ABXAGNTS-912/913)
+    enforce  ABXAGNTS-912: for ``ENFORCED_CAPABILITIES`` the probe runs
+             synchronously and GATES execution — allow runs the tool,
+             deny / error / unavailable means the tool NEVER runs
+             (fail closed), with an explicit deny reason returned to the
+             caller/persona. All other mapped capabilities keep shadow
+             (async, log only) behavior.
 
 Other env vars:
     AGENTSPP_BASE_URL            Agents++ instance (default http://localhost:3100)
@@ -74,6 +78,37 @@ _USE_UNITREE_OPS: Dict[tuple, str] = {
 ALL_CAPABILITIES: List[str] = sorted(
     set(NEON_OPERATION_CAPABILITY_MAP.values()) | set(_USE_UNITREE_OPS.values())
 )
+
+# ─────────────────────────────────────────────────────────────────────────
+# ABXAGNTS-912: the enforcement set.
+# In `enforce` mode, operations resolving to one of these capabilities run
+# the probe synchronously and the decision gates execution:
+#   allow            -> the tool runs
+#   deny             -> the tool NEVER runs, explicit reason returned
+#   error/unavailable-> fail closed (same as deny)
+# Every other mapped capability stays shadow (async probe, log only).
+# NOTE: robot.motion.stop is deliberately NOT enforced — enforcement must
+# never be able to prevent stopping the robot. ABXAGNTS-913 grows this set.
+# ─────────────────────────────────────────────────────────────────────────
+ENFORCED_CAPABILITIES = frozenset({
+    "robot.motion.walk",
+    "robot.control.fsm.change",
+    "robot.dds.publish.raw",
+})
+
+
+def is_enforced(capability: Optional[str]) -> bool:
+    """True when a capability is in the 912 enforcement set."""
+    return capability in ENFORCED_CAPABILITIES
+
+
+def enforcement_active(
+    tool_name: str, args: Optional[Mapping[str, Any]] = None
+) -> bool:
+    """True when a call to this operation is gated in enforce mode."""
+    return authz_mode() == "enforce" and is_enforced(
+        resolve_neon_capability(tool_name, args)
+    )
 
 
 def resolve_neon_capability(
@@ -236,6 +271,8 @@ def _probe_sync(
         "reason": None,
         "error": None,
     }
+    if mode == "enforce" and is_enforced(capability):
+        meta["enforced"] = True
     if tool_use_id:
         meta["tool_use_id"] = tool_use_id
 
@@ -311,13 +348,18 @@ def probe(
     tool_use_id: Optional[str] = None,
     blocking: bool = False,
 ) -> Optional[Any]:
-    """Pre-invocation authorization probe (shadow phase).
+    """Pre-invocation authorization probe / gate.
 
-    No-op unless ``NEON_AUTHZ_MODE`` is shadow/enforce AND the operation
-    resolves to a capability. In the shadow phase the probe runs on a
-    daemon thread so the tool path (especially the latency-critical voice
-    path) never waits on Agents++. Returns None (fire-and-forget) unless
-    ``blocking=True`` (enforcement phase, later ticket).
+    No-op (returns None) unless ``NEON_AUTHZ_MODE`` is shadow/enforce AND
+    the operation resolves to a capability. Behavior by mode:
+
+    - shadow (or enforce for non-enforced capabilities): the probe runs on
+      a daemon thread so the tool path (especially the latency-critical
+      voice path) never waits on Agents++. Returns None (fire-and-forget).
+    - enforce + ``ENFORCED_CAPABILITIES`` (ABXAGNTS-912): runs the probe
+      synchronously and returns its meta. The caller applies
+      :func:`enforcement_verdict` to gate execution (fail closed).
+    - ``blocking=True``: force the synchronous path (test hook).
     """
     try:
         if authz_mode() == "off":
@@ -325,7 +367,7 @@ def probe(
         capability = resolve_neon_capability(tool_name, args)
         if capability is None:
             return None
-        if blocking:
+        if blocking or (authz_mode() == "enforce" and is_enforced(capability)):
             return _probe_sync(tool_name, args, persona, capability, tool_use_id)
         threading.Thread(
             target=_probe_sync,
@@ -336,3 +378,44 @@ def probe(
     except Exception as e:  # the authz path must never take down a tool
         _notice_once(f"probe:{tool_name}", f"authz probe failed: {e!r}")
         return None
+
+
+def enforcement_verdict(meta: Optional[Mapping[str, Any]]) -> tuple:
+    """Map a synchronous probe meta to ``(verdict, reason)`` for gating.
+
+    Fail closed: ANY meta without a usable ``allow`` decision — deny,
+    error, missing artifacts, None — yields ``("deny", reason)``. The
+    reason is the explicit message returned to the caller/persona.
+    """
+    if not isinstance(meta, Mapping):
+        return ("deny", "authorization service unavailable")
+    decision = meta.get("decision")
+    reason = meta.get("reason")
+    if decision == "allow":
+        return ("allow", reason or "allowed by credential")
+    if decision == "deny":
+        return ("deny", reason or "capability not in credential")
+    err = meta.get("error")
+    err_msg = None
+    if isinstance(err, Mapping):
+        err_msg = err.get("message") or err.get("error")
+    return ("deny", reason or err_msg or "authorization service unavailable")
+
+
+def deny_payload(reason: str, decision_id: Optional[str] = None) -> Dict[str, Any]:
+    """Strands-shaped ToolResult for a denied operation.
+
+    ``status`` is ``error`` (the only valid non-success status in the
+    strands ToolResult contract); the explicit denial lives in the text
+    so the model/persona hears it, and in the json block for machines.
+    """
+    text = f"DENIED by authorization policy: {reason}"
+    if decision_id:
+        text += f" (decision_id={decision_id})"
+    return {
+        "status": "error",
+        "content": [
+            {"text": text},
+            {"json": {"denied": True, "reason": reason, "decision_id": decision_id}},
+        ],
+    }
