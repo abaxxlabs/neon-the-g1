@@ -19,7 +19,6 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -36,12 +35,22 @@ from tools import agent_log, agentspp_authz, tool_log
 # fakes (same pattern as tests/test_agentspp_authz.py)
 # ─────────────────────────────────────────────────────────────────────────
 class FakeClient:
+    """Client-side fake of the Agents++ REST surface. Since ABXAGNTS-927 NEON
+    talks to Agents++ exclusively through the agents_* Strands tools built on
+    top of this client — the tools are real, only this boundary is faked."""
+    base_url = "fake"
+
     def __init__(self, fail: bool = False):
         self.fail = fail
         self.sessions = 0
         self.agents = 0
         self.creds = 0
         self.pres = 0
+        self.issued = {}        # agent_did -> caps issued in its VC
+        self.decides = []       # one entry per authorize_action call
+        self.decide_fixed = None
+        self.decide_seq = []
+        self.decide_error = None
 
     def _maybe_fail(self):
         if self.fail:
@@ -61,6 +70,7 @@ class FakeClient:
                          actions=None, capabilities=None, expires_in=None, **kw):
         self._maybe_fail()
         self.creds += 1
+        self.issued[agent] = [c["action"] for c in (capabilities or [])]
         return "vc.jwt"
 
     def build_presentation(self, session, agent, credential, audience=None,
@@ -69,25 +79,27 @@ class FakeClient:
         self.pres += 1
         return {"presentation": "vp.jwt", "jti": "jti-1"}
 
-
-def _fake_gate(decision=None, reason=None, error=None):
-    """Replacement for pkg.run_authorization_gate capturing its kwargs."""
-    calls = []
-
-    def _gate(client, mode, **kw):
-        calls.append({"mode": mode, **kw})
-        return SimpleNamespace(
-            mode=mode,
-            attempted=True,
-            capability=kw.get("capability"),
-            decision=decision,
-            reason=reason,
-            error=error,
-            extra={},
-        )
-
-    _gate.calls = calls
-    return _gate
+    def authorize_action(self, session, *, agent_did, persona, capability, vc, vp,
+                         action="invoke_tool", scope=None, context=None):
+        """Emulates /authorization/decide server-side: credential-driven —
+        allow iff the capability is in this agent's ISSUED VC."""
+        self._maybe_fail()
+        self.decides.append({
+            "session": session, "agent_did": agent_did, "persona": persona,
+            "capability": capability, "vc": vc, "vp": vp,
+        })
+        if self.decide_error is not None:
+            raise self.decide_error
+        if self.decide_fixed is not None:
+            return self.decide_fixed
+        if self.decide_seq:
+            return self.decide_seq.pop(0)
+        ok = capability in self.issued.get(agent_did, [])
+        return {
+            "decision": "allow" if ok else "deny",
+            "decision_id": f"d-{len(self.decides)}",
+            "reason": None if ok else f"Action '{capability}' not permitted on any resource",
+        }
 
 
 class _SpyInner:
@@ -115,6 +127,7 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_log, "DB", path)
     monkeypatch.setattr(agentspp_authz, "_artifacts", {})
     monkeypatch.setattr(agentspp_authz, "_failed_at", {})
+    monkeypatch.setattr(agentspp_authz, "_tools_cache", {})
     agentspp_authz._noticed.clear()
     yield path
 
@@ -129,11 +142,10 @@ def _rows(path):
     return [(p, r, t, json.loads(m) if m else None) for p, r, t, m in rows]
 
 
-def _authed(monkeypatch, gate, fake=None):
-    """Point the package at a fake client + fake gate (real _probe_sync)."""
+def _authed(monkeypatch, fake=None):
+    """Point the package at a fake client (real _probe_sync + real tools)."""
     fake = fake or FakeClient()
     monkeypatch.setattr(pkg, "default_client", lambda *a, **k: fake)
-    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
     return fake
 
 
@@ -222,40 +234,44 @@ def test_enforcement_active_matrix(monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────
 def test_probe_enforce_runs_sync_and_returns_meta(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    gate = _fake_gate(decision={"decision": "allow", "decision_id": "d-1"})
-    _authed(monkeypatch, gate)
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "allow", "decision_id": "d-1"}
+    _authed(monkeypatch, fake)
     meta = agentspp_authz.probe("g1_turn", {"angle": 0.5}, "shell")
     assert meta is not None
     assert meta["enforced"] is True
     assert meta["decision"] == "allow"
-    assert len(gate.calls) == 1
+    assert len(fake.decides) == 1
 
 
 def test_probe_enforce_non_enforced_cap_stays_async(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    gate = _fake_gate(decision={"decision": "allow", "decision_id": "d-1"})
-    _authed(monkeypatch, gate)
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "allow", "decision_id": "d-1"}
+    _authed(monkeypatch, fake)
     out = agentspp_authz.probe("g1_arm_action", {}, "shell")
     assert out is None  # fire-and-forget, like shadow
     deadline = time.monotonic() + 2
-    while not gate.calls and time.monotonic() < deadline:
+    while not fake.decides and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert len(gate.calls) == 1
+    assert len(fake.decides) == 1
 
 
 def test_probe_shadow_never_blocks(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
-    gate = _fake_gate(decision={"decision": "allow", "decision_id": "d-1"})
-    _authed(monkeypatch, gate)
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "allow", "decision_id": "d-1"}
+    _authed(monkeypatch, fake)
     assert agentspp_authz.probe("g1_turn", {"angle": 0.5}, "shell") is None
 
 
 def test_probe_off_no_gate(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "off")
-    gate = _fake_gate(decision={"decision": "allow"})
-    _authed(monkeypatch, gate)
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "allow"}
+    _authed(monkeypatch, fake)
     assert agentspp_authz.probe("g1_turn", {"angle": 0.5}, "shell") is None
-    assert gate.calls == []
+    assert fake.decides == []
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -263,9 +279,10 @@ def test_probe_off_no_gate(monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────
 def test_stream_denied_never_reaches_inner(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    gate = _fake_gate(decision={"decision": "deny", "decision_id": "d-9"},
-                      reason="capability not in credential")
-    _authed(monkeypatch, gate)
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "deny", "decision_id": "d-9",
+                         "reason": "capability not in credential"}
+    _authed(monkeypatch, fake)
     inner = _SpyInner("g1_turn")
     t = tool_log.LoggedTool(inner, persona="shell")
 
@@ -285,9 +302,10 @@ def test_stream_denied_never_reaches_inner(monkeypatch):
 
 def test_stream_event_is_tool_result_event(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    gate = _fake_gate(decision={"decision": "deny", "decision_id": "d-1"},
-                      reason="capability not in credential")
-    _authed(monkeypatch, gate)
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "deny", "decision_id": "d-1",
+                         "reason": "capability not in credential"}
+    _authed(monkeypatch, fake)
     t = tool_log.LoggedTool(_SpyInner("g1_turn"), persona="shell")
     events = _stream(t, _walk_tu())
     from strands.types._events import ToolResultEvent
@@ -297,8 +315,9 @@ def test_stream_event_is_tool_result_event(monkeypatch):
 
 def test_stream_allowed_runs_inner_normally(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    gate = _fake_gate(decision={"decision": "allow", "decision_id": "d-2"})
-    _authed(monkeypatch, gate)
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "allow", "decision_id": "d-2"}
+    _authed(monkeypatch, fake)
     inner = _SpyInner("g1_turn")
     t = tool_log.LoggedTool(inner, persona="shell")
 
@@ -312,14 +331,13 @@ def test_stream_allowed_runs_inner_normally(monkeypatch):
 def test_stream_fail_closed_when_authz_down(monkeypatch):
     """AC: authz unavailability denies high-risk operations."""
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    gate = _fake_gate(decision={"decision": "allow"})  # never reached
-    _authed(monkeypatch, gate, fake=FakeClient(fail=True))
+    fake = _authed(monkeypatch, FakeClient(fail=True))
     inner = _SpyInner("g1_turn")
     t = tool_log.LoggedTool(inner, persona="shell")
 
     events = _stream(t, _walk_tu())
     assert inner.calls == 0
-    assert gate.calls == []  # bootstrap failed before any decide
+    assert fake.decides == []  # bootstrap failed before any decide
     payload = events[0].tool_result if hasattr(events[0], "tool_result") else events[0]
     assert _deny_text(payload).startswith("DENIED by authorization policy")
 
@@ -329,19 +347,12 @@ def test_stream_revoke_effective_without_redeploy(monkeypatch):
     revoked server-side, the next probe must deny. The artifacts (session/
     agent/VC) stay cached: no re-bootstrap, no redeploy."""
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    seq = iter([
+    fake = FakeClient()
+    fake.decide_seq = [
         {"decision": "allow", "decision_id": "d-a"},
         {"decision": "deny", "decision_id": "d-r"},  # post-revocation
-    ])
-    gate = _fake_gate()
-
-    def _revoking_gate(client, mode, **kw):
-        gate.calls.append(kw)
-        d = next(seq)
-        return SimpleNamespace(mode=mode, attempted=True, capability=kw.get("capability"),
-                               decision=d, reason=None, error=None, extra={})
-
-    fake = _authed(monkeypatch, _revoking_gate)
+    ]
+    _authed(monkeypatch, fake)
     inner = _SpyInner("g1_turn")
     t = tool_log.LoggedTool(inner, persona="shell")
 
@@ -356,9 +367,10 @@ def test_stream_revoke_effective_without_redeploy(monkeypatch):
 
 def test_stream_enforce_non_enforced_cap_not_gated(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    gate = _fake_gate(decision={"decision": "deny", "decision_id": "d-x"},
-                      reason="capability not in credential")
-    _authed(monkeypatch, gate)
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "deny", "decision_id": "d-x",
+                         "reason": "capability not in credential"}
+    _authed(monkeypatch, fake)
     inner = _SpyInner("g1_arm_action")
     t = tool_log.LoggedTool(inner, persona="shell")
 
@@ -404,9 +416,10 @@ def test_stream_gate_bug_never_touches_non_enforced(monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────
 def test_call_denied_returns_payload_and_skips_inner(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    gate = _fake_gate(decision={"decision": "deny", "decision_id": "d-c"},
-                      reason="capability not in credential")
-    _authed(monkeypatch, gate)
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "deny", "decision_id": "d-c",
+                         "reason": "capability not in credential"}
+    _authed(monkeypatch, fake)
     inner = _SpyInner("g1_turn")
     t = tool_log.LoggedTool(inner, persona="shell")
 
@@ -419,8 +432,9 @@ def test_call_denied_returns_payload_and_skips_inner(monkeypatch):
 
 def test_call_allowed_runs_inner(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    gate = _fake_gate(decision={"decision": "allow", "decision_id": "d-c2"})
-    _authed(monkeypatch, gate)
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "allow", "decision_id": "d-c2"}
+    _authed(monkeypatch, fake)
     inner = _SpyInner("g1_turn")
     t = tool_log.LoggedTool(inner, persona="shell")
 
@@ -431,8 +445,7 @@ def test_call_allowed_runs_inner(monkeypatch):
 
 def test_call_fail_closed_when_authz_down(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    gate = _fake_gate(decision={"decision": "allow"})
-    _authed(monkeypatch, gate, fake=FakeClient(fail=True))
+    fake = _authed(monkeypatch, FakeClient(fail=True))
     inner = _SpyInner("g1_turn")
     t = tool_log.LoggedTool(inner, persona="shell")
 
@@ -444,15 +457,16 @@ def test_call_fail_closed_when_authz_down(monkeypatch):
 
 def test_call_off_mode_unchanged(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "off")
-    gate = _fake_gate(decision={"decision": "deny"})
-    _authed(monkeypatch, gate)
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "deny"}
+    _authed(monkeypatch, fake)
     inner = _SpyInner("g1_turn")
     t = tool_log.LoggedTool(inner, persona="shell")
 
     out = t(angle=0.5)
     assert inner.calls == 1
     assert out["status"] == "success"
-    assert gate.calls == []
+    assert fake.decides == []
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -460,9 +474,10 @@ def test_call_off_mode_unchanged(monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────
 def test_deny_journal_rows_and_format_for_prompt_clean(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    gate = _fake_gate(decision={"decision": "deny", "decision_id": "d-j"},
-                      reason="capability not in credential")
-    _authed(monkeypatch, gate)
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "deny", "decision_id": "d-j",
+                         "reason": "capability not in credential"}
+    _authed(monkeypatch, fake)
     inner = _SpyInner("g1_turn")
     t = tool_log.LoggedTool(inner, persona="voice")
 

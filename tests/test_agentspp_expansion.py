@@ -22,7 +22,6 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -39,9 +38,18 @@ from tools import agent_log, agentspp_authz, tool_log
 # fakes
 # ─────────────────────────────────────────────────────────────────────────
 class FakeClient:
+    """Client-side fake of the Agents++ REST surface. Since ABXAGNTS-927 NEON
+    talks to Agents++ exclusively through the agents_* Strands tools built on
+    top of this client — the tools are real, only this boundary is faked.
+    ``authorize_action`` emulates the server's credential semantics: allow
+    iff the capability is in this agent's ISSUED VC (that is what makes the
+    persona-matrix denial testable here)."""
+    base_url = "fake"
+
     def __init__(self, fail: bool = False):
         self.fail = fail
-        self.issued: list = []  # capabilities lists per issue_credential call
+        self.issued = {}      # agent_did -> caps issued in its VC
+        self.decides = []
         self.agents = 0
 
     def _maybe_fail(self):
@@ -60,7 +68,8 @@ class FakeClient:
     def issue_credential(self, session, agent, profile=None, columns=None,
                          actions=None, capabilities=None, expires_in=None, **kw):
         self._maybe_fail()
-        self.issued.append([c["action"] for c in (capabilities or [])])
+        self.agents  # (counted in create_agent)
+        self.issued[agent] = [c["action"] for c in (capabilities or [])]
         return "vc.jwt"
 
     def build_presentation(self, session, agent, credential, audience=None,
@@ -68,28 +77,21 @@ class FakeClient:
         self._maybe_fail()
         return {"presentation": "vp.jwt", "jti": "jti-1"}
 
+    def authorize_action(self, session, *, agent_did, persona, capability, vc, vp,
+                         action="invoke_tool", scope=None, context=None):
+        self._maybe_fail()
+        self.decides.append({"agent_did": agent_did, "persona": persona,
+                             "capability": capability, "vp": vp})
+        ok = capability in self.issued.get(agent_did, [])
+        return {
+            "decision": "allow" if ok else "deny",
+            "decision_id": f"d-{len(self.decides)}",
+            "reason": None if ok else f"Action '{capability}' not permitted on any resource",
+        }
 
-def _credential_gate(client: FakeClient):
-    """Emulates /authorization/decide: allow iff the capability is in the
-    caps ISSUED to this persona's VC (what the real server does)."""
-
-    calls = []
-
-    def _gate(cc, mode, **kw):
-        cap = kw.get("capability")
-        calls.append(kw)
-        issued = client.issued[-1] if (client is not None and client.issued) else []
-        ok = cap in issued
-        return SimpleNamespace(
-            mode=mode, attempted=True, capability=cap,
-            decision={"decision": "allow" if ok else "deny",
-                      "decision_id": "d-" + (cap or "x")},
-            reason=None if ok else f"Action '{cap}' not permitted on any resource",
-            error=None, extra={},
-        )
-
-    _gate.calls = calls
-    return _gate
+    @property
+    def last_caps(self):
+        return list(self.issued.values())[-1] if self.issued else []
 
 
 class _SpyInner:
@@ -114,6 +116,7 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_log, "DB", path)
     monkeypatch.setattr(agentspp_authz, "_artifacts", {})
     monkeypatch.setattr(agentspp_authz, "_failed_at", {})
+    monkeypatch.setattr(agentspp_authz, "_tools_cache", {})
     agentspp_authz._noticed.clear()
     yield path
 
@@ -128,11 +131,10 @@ def _rows(path):
     return [(p, r, t, json.loads(m) if m else None) for p, r, t, m in rows]
 
 
-def _authed(monkeypatch, gate, fake=None, mode="enforce"):
+def _authed(monkeypatch, fake=None, mode="enforce"):
     fake = fake or FakeClient()
     monkeypatch.setenv("NEON_AUTHZ_MODE", mode)
     monkeypatch.setattr(pkg, "default_client", lambda *a, **k: fake)
-    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
     return fake
 
 
@@ -222,30 +224,30 @@ def test_unknown_persona_zero_trust():
 
 def test_bootstrap_issues_persona_caps(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    fake = _authed(monkeypatch, _credential_gate(None))
+    fake = _authed(monkeypatch)
     art = agentspp_authz._get_artifacts("voice")
     assert art is not None
-    assert sorted(fake.issued[-1]) == sorted(["robot.arm.gesture",
-                               "robot.motion.stop", "robot.motion.walk"])
+    assert sorted(fake.last_caps) == sorted(["robot.arm.gesture",
+                                             "robot.motion.stop", "robot.motion.walk"])
 
 
 def test_mcp_vc_has_no_walk(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "enforce")
-    fake = _authed(monkeypatch, _credential_gate(None))
+    fake = _authed(monkeypatch)
     art = agentspp_authz._get_artifacts("mcp")
     assert art is not None
-    assert "robot.motion.walk" not in fake.issued[-1]
-    assert "robot.control.fsm.change" not in fake.issued[-1]
-    assert "robot.control.zerotorque" not in fake.issued[-1]
-    assert "robot.control.sdk.rpc" not in fake.issued[-1]
+    assert "robot.motion.walk" not in fake.last_caps
+    assert "robot.control.fsm.change" not in fake.last_caps
+    assert "robot.control.zerotorque" not in fake.last_caps
+    assert "robot.control.sdk.rpc" not in fake.last_caps
 
 
 def test_env_override_still_wins(monkeypatch):
     monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
     monkeypatch.setenv("NEON_AUTHZ_VC_CAPABILITIES", "robot.motion.walk")
-    fake = _authed(monkeypatch, _credential_gate(None))
+    fake = _authed(monkeypatch)
     art = agentspp_authz._get_artifacts("shell")
-    assert fake.issued[-1] == ["robot.motion.walk"]
+    assert fake.last_caps == ["robot.motion.walk"]
 
 
 def test_mcp_server_declares_its_own_persona():
@@ -259,7 +261,7 @@ def test_mcp_server_declares_its_own_persona():
 def test_mcp_cannot_walk_dedicated_tool(monkeypatch):
     """The --safe bypass, sealed: walk denied for mcp at the credential level."""
     fake = FakeClient()
-    _authed(monkeypatch, _credential_gate(fake), fake=fake)
+    _authed(monkeypatch, fake)
     inner = _SpyInner("g1_turn")
     t = tool_log.LoggedTool(inner, persona="mcp")
 
@@ -271,7 +273,7 @@ def test_mcp_cannot_walk_dedicated_tool(monkeypatch):
 def test_mcp_cannot_walk_via_hammer(monkeypatch):
     """Same denial through use_unitree — the path --safe left open today."""
     fake = FakeClient()
-    _authed(monkeypatch, _credential_gate(fake), fake=fake)
+    _authed(monkeypatch, fake)
     inner = _SpyInner("use_unitree")
     t = tool_log.LoggedTool(inner, persona="mcp")
 
@@ -285,7 +287,7 @@ def test_mcp_cannot_walk_via_hammer(monkeypatch):
 def test_mcp_can_still_stop(monkeypatch):
     """Stop is granted to every persona — enforcement never blocks it."""
     fake = FakeClient()
-    _authed(monkeypatch, _credential_gate(fake), fake=fake)
+    _authed(monkeypatch, fake)
     inner = _SpyInner("g1_stop_move")
     t = tool_log.LoggedTool(inner, persona="mcp")
 
@@ -298,7 +300,7 @@ def test_shell_zerotorque_allowed(monkeypatch):
     """Faithful to today: zerotorque is not blocked (granted to full
     toolsets), but now it is ENFORCED-shaped and audited."""
     fake = FakeClient()
-    _authed(monkeypatch, _credential_gate(fake), fake=fake)
+    _authed(monkeypatch, fake)
     inner = _SpyInner("use_unitree")
     t = tool_log.LoggedTool(inner, persona="shell")
 
@@ -314,7 +316,7 @@ def test_sdk_rpc_shadow_never_blocks(monkeypatch):
     paper (journal), executed in fact (shadow) — faithful to today's
     warn-only danger gate."""
     fake = FakeClient()
-    _authed(monkeypatch, _credential_gate(fake), fake=fake)
+    _authed(monkeypatch, fake)
     inner = _SpyInner("use_unitree")
     t = tool_log.LoggedTool(inner, persona="mcp")
 
@@ -330,11 +332,10 @@ def test_sdk_rpc_shadow_never_blocks(monkeypatch):
 
 
 def test_off_mode_matrix_inert(monkeypatch):
-    fake = FakeClient()
-    _authed(monkeypatch, _credential_gate(fake), mode="off")
+    fake = _authed(monkeypatch, mode="off")
     inner = _SpyInner("g1_turn")
     t = tool_log.LoggedTool(inner, persona="mcp")
 
     events = _stream(t, {"toolUseId": "x-6", "input": {"angle": 0.5}})
     assert inner.calls == 1
-    assert fake.issued == []  # no bootstrap, no VC, zero overhead
+    assert fake.issued == {}  # no bootstrap, no VC, zero overhead

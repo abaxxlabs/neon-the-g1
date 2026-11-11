@@ -44,6 +44,15 @@ ABXAGNTS-913 (persona matrix)
     personas get a zero-capability VC (zero trust). Every robot MUTATION now
     resolves to a capability (the use_unitree hammer's unlisted mutative RPCs
     fall back to ``robot.control.sdk.rpc``); only reads stay unmapped.
+
+ABXAGNTS-927 (Strands tools surface)
+    Every Agents++ operation — session/identity bootstrap, per-persona agent
+    creation, credential issuance, presentations and the per-operation
+    decision — goes through the package's ``agents_*`` Strands tools
+    (``create_agentspp_tools``), never through the REST client directly.
+    The tools are invoked PROGRAMMATICALLY by app code and are NEVER
+    registered on the model's Agent toolset: a model that could call
+    ``agents_issue_credential`` could self-issue capabilities.
 """
 from __future__ import annotations
 
@@ -247,6 +256,47 @@ _lock = threading.Lock()
 _artifacts: Dict[str, Dict[str, Any]] = {}
 _failed_at: Dict[str, float] = {}
 _noticed: set = set()
+_tools_cache: Dict[str, Dict[str, Any]] = {}
+
+# The five agents_* Strands tools that make up NEON's Agents++ surface.
+_AUTHZ_TOOL_NAMES = (
+    "agents_create_session",
+    "agents_create_agent",
+    "agents_issue_credential",
+    "agents_build_presentation",
+    "agents_authorize_action",
+)
+
+
+def _authz_tools() -> Dict[str, Any]:
+    """The ``agents_*`` Strands tools — NEON's ONLY integration path against
+    Agents++ (ABXAGNTS-927).
+
+    Session/identity bootstrap, credential issuance, presentations and the
+    per-operation decision all go through the package's Strands tool surface
+    (``create_agentspp_tools``), never through the REST client directly.
+
+    Security invariant: these tool objects are invoked PROGRAMMATICALLY by
+    app code (bootstrap + the LoggedTool choke point). They are deliberately
+    NEVER registered on the model's Agent toolset — a model that could call
+    ``agents_issue_credential`` could issue itself a VC with arbitrary
+    capabilities (self privilege-escalation). A Strands tool called by the
+    app is still a Strands tool: same wrapper, same schema, different caller.
+    """
+    pkg = _load_package()
+    if pkg is None:
+        return {}
+    client = pkg.default_client()
+    url = getattr(client, "base_url", None) or "default"
+    with _lock:
+        cached = _tools_cache.get(url)
+        if cached is None:
+            cached = {
+                t.tool_name: t
+                for t in pkg.create_agentspp_tools(client, only=list(_AUTHZ_TOOL_NAMES))
+            }
+            _tools_cache[url] = cached
+    return cached
 
 
 def _notice_once(key: str, msg: str) -> None:
@@ -293,17 +343,18 @@ def _get_artifacts(persona: str) -> Optional[Dict[str, Any]]:
         if last is not None and time.monotonic() - last < _RETRY_COOLDOWN_S:
             return None
     try:
-        client = pkg.default_client()  # reads AGENTSPP_BASE_URL
+        # ABXAGNTS-927: identity + credentials through the agents_* Strands
+        # tools (the package's documented surface), not the raw client.
+        tools = _authz_tools()
+        if not tools:
+            return None
         bearer = os.getenv("AGENTSPP_BEARER_TOKEN")
-        session_resp = (
-            client.create_session(bearer_token=bearer)
-            if bearer
-            else client.create_session(
-                mock_human_did=os.getenv("NEON_AUTHZ_HUMAN_DID", "did:web:neon-dev")
-            )
+        session_resp = tools["agents_create_session"](
+            bearer_token=bearer or "",
+            mock_human_did="" if bearer else os.getenv("NEON_AUTHZ_HUMAN_DID", "did:web:neon-dev"),
         )
         session = session_resp["sessionId"]
-        agent = client.create_agent(session, name=f"neon-{persona}")
+        agent = tools["agents_create_agent"](session, name=f"neon-{persona}")
         agent_did = agent["did"]
         caps_env = os.getenv("NEON_AUTHZ_VC_CAPABILITIES", "")
         caps = (
@@ -311,13 +362,14 @@ def _get_artifacts(persona: str) -> Optional[Dict[str, Any]]:
             if caps_env
             else persona_caps(persona)
         )
-        vc = client.issue_credential(
+        vc = tools["agents_issue_credential"](
             session, agent_did, profile="capability",
             capabilities=[{"action": c} for c in caps],
         )
         if isinstance(vc, Mapping):
             vc = vc.get("vc") or vc.get("credential")
-        pres = client.build_presentation(session, agent_did, vc)
+        # lifetime="" -> server default (same as the pre-927 client call)
+        pres = tools["agents_build_presentation"](session, agent_did, vc, lifetime="")
         vp = pres["presentation"] if isinstance(pres, Mapping) else pres
         artifacts = {
             "session": session,
@@ -351,6 +403,7 @@ def _reset_bootstrap_state() -> None:
     with _lock:
         _artifacts.clear()
         _failed_at.clear()
+        _tools_cache.clear()
     _noticed.clear()
 
 
@@ -386,49 +439,51 @@ def _probe_sync(
     if artifacts is None:
         meta["reason"] = "artifacts unavailable"
     else:
-        pkg = _load_package()
-        # A presentation is single-use (anti-replay nonce is consumed by the
-        # first decide that carries it), so every probe mints a fresh one
-        # from the cached VC. Only on a present failure do we fall back to a
-        # bootstrap-time presentation (test doubles / degraded shadow).
-        vp = None
-        present_error = None
-        try:
-            pres = pkg.default_client().build_presentation(
-                artifacts["session"], artifacts["agent_did"], artifacts["vc"]
-            )
-            vp = pres["presentation"] if isinstance(pres, Mapping) else pres
-        except Exception as e:
-            present_error = e
-        if vp is None:
-            vp = artifacts.get("vp")
-        if vp is None:
-            meta["error"] = {"message": f"presentation failed: {present_error!r}"}
+        tools = _authz_tools()
+        if not tools:
+            meta["reason"] = "artifacts unavailable"
         else:
+            # A presentation is single-use (anti-replay nonce is consumed by
+            # the first decide that carries it), so every probe mints a fresh
+            # one from the cached VC — via the agents_build_presentation
+            # tool. Only on a present failure do we fall back to a
+            # bootstrap-time presentation (test doubles / degraded shadow).
+            vp = None
+            present_error = None
             try:
-                res = pkg.run_authorization_gate(
-                    pkg.default_client(),
-                    mode,
-                    session=artifacts["session"],
-                    agent_did=artifacts["agent_did"],
-                    persona=persona,
-                    channel=persona,
-                    tool=tool_name,
-                    operation=tool_name,
-                    vc=artifacts["vc"],
-                    vp=vp,
-                    capability=capability,
-                    context={"args": dict(args) if isinstance(args, Mapping) else args},
+                pres = tools["agents_build_presentation"](
+                    artifacts["session"], artifacts["agent_did"],
+                    artifacts["vc"], lifetime="",
                 )
-                decision = res.decision or {}
-                meta["decision"] = decision.get("decision")
-                meta["decision_id"] = decision.get("decision_id")
-                meta["reason"] = decision.get("reason") or res.reason
-                # Capture the whole error mapping — the gate may carry a
-                # {"message": ...} shape that has no status/error keys.
-                meta["error"] = dict(res.error) if res.error else None
-            except Exception as e:  # the gate contract is never-raise; belt & braces
-                meta["reason"] = f"gate error: {e!r}"
+                vp = pres["presentation"] if isinstance(pres, Mapping) else pres
+            except Exception as e:
+                present_error = e
+            if vp is None:
+                vp = artifacts.get("vp")
+            if vp is None:
+                meta["error"] = {"message": f"presentation failed: {present_error!r}"}
+            else:
+                # ABXAGNTS-927: the decision goes through the
+                # agents_authorize_action Strands tool (credential-driven
+                # allow/deny decided server-side from the verified VC/VP).
+                try:
+                    decision = tools["agents_authorize_action"](
+                        artifacts["session"], artifacts["agent_did"],
+                        persona, capability, artifacts["vc"], vp,
+                        action="invoke_tool",
+                        context={
+                            "tool": tool_name,
+                            "persona": persona,
+                            "channel": persona,
+                            "args": dict(args) if isinstance(args, Mapping) else args,
+                        },
+                    ) or {}
+                    meta["decision"] = decision.get("decision")
+                    meta["decision_id"] = decision.get("decision_id")
+                    meta["reason"] = decision.get("reason")
+                except Exception as e:  # transport/protocol error — never raise
+                    meta["error"] = {"message": str(e)}
+                    meta["reason"] = f"gate error: {e!r}"
 
     verdict = meta["decision"] or ("ERROR" if meta["error"] or meta["reason"] == "artifacts unavailable" else "UNKNOWN")
     line = (
