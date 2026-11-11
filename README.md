@@ -124,14 +124,15 @@ make help                         # every target
   then measures its displacement and says "done" only when `moved=true`.
 - Arm actions are mutex-locked on `rt/armsdk` and auto-release.
 - Raw publishes to motor topics need `unsafe=True`; `use_unitree` flags the
-  seven high-danger RPCs.
+  seven high-danger RPCs (always — the env-var warning bypass was removed in
+  ABXAGNTS-914).
 - FSM 0 (ZeroTorque) collapses the robot: gantry only.
 
 [The eight gates](https://cagataycali.github.io/neon-the-g1/guide/safety/).
 
 ## authorization (Agents++ probe / enforcement)
 
-Optional policy layer (ABXAGNTS-911/912/913): before mapped high-risk
+Optional policy layer (ABXAGNTS-911/912/913/914): before mapped high-risk
 operations (locomotion, FSM change, ZeroTorque, raw DDS publish, arm gestures,
 and any other mutative SDK RPC) execute, NEON asks an
 [Agents++](https://github.com/abaxxlabs/agentspp-strands-tools) instance
@@ -172,6 +173,15 @@ operation is mapped in `tools/agentspp_authz.py` — add a row (or a
 `(service, operation)` pair) there to map a new operation; add the
 capability to `ENFORCED_CAPABILITIES` to gate it in `enforce` mode; add the
 persona to `PERSONA_CAPABILITY_MATRIX` to grant it capabilities.
+
+**Rollout complete (914).** Operational guide — mode matrix, verification,
+rollback (environment-only, validated), incident/recovery scenarios and the
+post-rollout checklist: [`docs/guide/authz-runbook.md`](docs/guide/authz-runbook.md).
+Cleanup delivered: `BYPASS_TOOL_CONSENT` removed (the danger warning is a
+local control and no longer has an env-var off switch), `neon-mcp --safe`
+deprecated as an authorization boundary (the mcp credential seals it) and
+kept as a prompt-availability control, and the physical safety gates audited
++ tested (`tests/test_physical_safety.py`).
 
 ## MCP server
 

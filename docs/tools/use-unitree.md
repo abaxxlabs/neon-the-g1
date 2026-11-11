@@ -62,9 +62,9 @@ Bad calls return a helpful error, not a crashed DDS writer.
 Seven operations are flagged `high_danger` in the reply whatever the
 environment: `loco.ZeroTorque`, `loco.SetFsmId`, `loco.SetVelocity`,
 `loco.Move`, `loco.WaveHand`, `loco.ShakeHand` and
-`motion_switcher.ReleaseMode`. Mutative operations are flagged too unless
-`BYPASS_TOOL_CONSENT=true` (the compose stack sets it); `Get*` and `Check*`
-calls are read-only and never flagged.
+`motion_switcher.ReleaseMode`. Mutative operations are flagged too, always
+(the `BYPASS_TOOL_CONSENT` env-var bypass was removed in ABXAGNTS-914); `Get*`
+and `Check*` calls are read-only and never flagged.
 
 ## composed vs universal
 

@@ -17,7 +17,7 @@ established in _g1_common.py — re-Init() can crash the process).
 
 Pattern:
   - @tool decorator (Strands native) with rich docstring for LLM grounding
-  - Mutative-op detection → flagged in response (BYPASS_TOOL_CONSENT=true skips)
+  - Mutative-op detection → flagged in response (always; the env-var bypass was removed in ABXAGNTS-914)
   - Parameter validation → helpful schema on error
   - Response normalization (tuple unpacking, JSON serialization)
 
@@ -530,7 +530,7 @@ def use_unitree(
     SAFETY RAILS (built in):
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
       • Mutative ops (Set*, Execute*, Move*, ...) are detected and flagged
-        in the response. BYPASS_TOOL_CONSENT=true skips confirmation prompts.
+        in the response, always (the env-var bypass was removed in 914).
       • HIGH_DANGER_OPS — always flagged loudly:
           (loco, ZeroTorque)             ← robot collapses
           (loco, SetFsmId)               ← if fsm_id=0 → collapse
@@ -655,16 +655,19 @@ def use_unitree(
         })
 
     # ── danger gate ───────────────────────────────────────────────────
+    # ABXAGNTS-914: BYPASS_TOOL_CONSENT removed — this warning is a local
+    # physical-safety control and must never be silent (it is the only hammer
+    # telemetry while the authz layer is off). With the authz layer on, the
+    # authoritative record is the role=authz journal row; this line is kept
+    # in both modes on purpose.
     high_danger = (service_name, operation_name) in HIGH_DANGER_OPS
     mutative = _is_mutative(operation_name)
-    bypass = os.environ.get("BYPASS_TOOL_CONSENT", "").lower() == "true"
 
-    if (high_danger or mutative) and not bypass:
+    if high_danger or mutative:
         logger.warning(
-            "use_unitree: %s.%s is %s (bypass=%s)",
+            "use_unitree: %s.%s is %s",
             service_name, operation_name,
             "HIGH_DANGER" if high_danger else "mutative",
-            bypass,
         )
 
     # ── execute ───────────────────────────────────────────────────────
