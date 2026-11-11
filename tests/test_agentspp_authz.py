@@ -10,7 +10,6 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +26,14 @@ from tools import agent_log, agentspp_authz, tool_log
 # fakes
 # ─────────────────────────────────────────────────────────────────────────
 class FakeClient:
+    """Client-side fake of the Agents++ REST surface.
+
+    Since ABXAGNTS-927 NEON talks to Agents++ exclusively through the
+    ``agents_*`` Strands tools built ON TOP of this client — the tools are
+    real, only this (HTTP-equivalent) boundary is faked.
+    """
+    base_url = "fake"
+
     def __init__(self, fail: bool = False):
         self.fail = fail
         self.attempts = 0
@@ -34,6 +41,11 @@ class FakeClient:
         self.agents = 0
         self.creds = 0
         self.pres = 0
+        self.issued = {}        # agent_did -> caps issued in its VC
+        self.decides = []       # one entry per authorize_action call
+        self.decide_fixed = None    # if set: always return this decision
+        self.decide_seq = []        # scripted decisions, FIFO
+        self.decide_error = None   # if set: raise from authorize_action
 
     def _maybe_fail(self):
         if self.fail:
@@ -54,6 +66,7 @@ class FakeClient:
                          actions=None, capabilities=None, expires_in=None, **kw):
         self._maybe_fail()
         self.creds += 1
+        self.issued[agent] = [c["action"] for c in (capabilities or [])]
         return "vc.jwt"  # /credentials returns the VC JWT as a JSON string
 
     def build_presentation(self, session, agent, credential, audience=None,
@@ -62,25 +75,28 @@ class FakeClient:
         self.pres += 1
         return {"presentation": "vp.jwt", "jti": "jti-1"}
 
-
-def _fake_gate(decision=None, reason=None, error=None):
-    """Replacement for pkg.run_authorization_gate capturing its kwargs."""
-    calls = []
-
-    def _gate(client, mode, **kw):
-        calls.append({"mode": mode, **kw})
-        return SimpleNamespace(
-            mode=mode,
-            attempted=True,
-            capability=kw.get("capability"),
-            decision=decision,
-            reason=reason,
-            error=error,
-            extra={},
-        )
-
-    _gate.calls = calls
-    return _gate
+    def authorize_action(self, session, *, agent_did, persona, capability, vc, vp,
+                         action="invoke_tool", scope=None, context=None):
+        """Emulates /authorization/decide server-side: credential-driven —
+        allow iff the capability is in this agent's ISSUED VC."""
+        self._maybe_fail()
+        self.decides.append({
+            "session": session, "agent_did": agent_did, "persona": persona,
+            "capability": capability, "vc": vc, "vp": vp,
+            "action": action, "context": context,
+        })
+        if self.decide_error is not None:
+            raise self.decide_error
+        if self.decide_fixed is not None:
+            return self.decide_fixed
+        if self.decide_seq:
+            return self.decide_seq.pop(0)
+        ok = capability in self.issued.get(agent_did, [])
+        return {
+            "decision": "allow" if ok else "deny",
+            "decision_id": f"d-{len(self.decides)}",
+            "reason": None if ok else f"Action '{capability}' not permitted on any resource",
+        }
 
 
 @pytest.fixture(autouse=True)
@@ -89,6 +105,7 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_log, "DB", path)
     monkeypatch.setattr(agentspp_authz, "_artifacts", {})
     monkeypatch.setattr(agentspp_authz, "_failed_at", {})
+    monkeypatch.setattr(agentspp_authz, "_tools_cache", {})
     agentspp_authz._noticed.clear()
     yield path
 
@@ -141,12 +158,12 @@ def test_resolve_map_unmapped_and_readonly():
 # mode gating
 # ─────────────────────────────────────────────────────────────────────────
 def test_mode_off_is_noop(monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: fake)
     monkeypatch.setenv("NEON_AUTHZ_MODE", "off")
-    gate = _fake_gate(decision={"decision": "ALLOW", "decision_id": "d-1"})
-    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
     out = agentspp_authz.probe("g1_turn", {"vx": 0.2}, "shell", blocking=True)
     assert out is None
-    assert gate.calls == []
+    assert fake.decides == []
     assert _rows(agent_log.DB) == []
 
 
@@ -156,12 +173,12 @@ def test_invalid_mode_falls_back_to_off(monkeypatch):
 
 
 def test_unmapped_operation_skips_probe(monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: fake)
     monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
-    gate = _fake_gate(decision={"decision": "ALLOW", "decision_id": "d-1"})
-    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
     out = agentspp_authz.probe("g1_get_state", {}, "shell", blocking=True)
     assert out is None
-    assert gate.calls == []
+    assert fake.decides == []
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -219,10 +236,11 @@ def test_bootstrap_mock_human_did_default(monkeypatch):
 # probe outcome recording
 # ─────────────────────────────────────────────────────────────────────────
 def test_probe_blocking_records_decision(monkeypatch):
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "ALLOW", "decision_id": "d-42",
+                         "reason": "capability granted"}
+    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: fake)
     monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
-    gate = _fake_gate(decision={"decision": "ALLOW", "decision_id": "d-42",
-                                "reason": "capability granted"})
-    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
     agentspp_authz._artifacts["shell"] = {
         "session": "s", "agent_did": "a", "vc": "v", "vp": "p", "capabilities": "c",
     }
@@ -232,11 +250,12 @@ def test_probe_blocking_records_decision(monkeypatch):
     assert meta["decision"] == "ALLOW"
     assert meta["decision_id"] == "d-42"
     assert meta["tool_use_id"] == "tu-1"
-    # gate was called with NEON capability + artifacts
-    call = gate.calls[0]
+    # the agents_authorize_action tool was called with NEON capability + artifacts
+    call = fake.decides[0]
     assert call["capability"] == "robot.motion.walk"
     assert call["session"] == "s" and call["agent_did"] == "a"
-    assert call["vc"] == "v" and call["vp"] == "p"
+    assert call["vc"] == "v"
+    assert call["vp"] == "vp.jwt"  # freshly minted via agents_build_presentation
     assert call["persona"] == "shell"
     # logged with role=authz, correlatable
     rows = [r for r in _rows(agent_log.DB) if r[1] == "authz"]
@@ -247,10 +266,11 @@ def test_probe_blocking_records_decision(monkeypatch):
 
 
 def test_probe_records_denay_and_error(monkeypatch):
+    fake = FakeClient()
+    fake.decide_fixed = {"decision": "DENY", "decision_id": "d-9",
+                         "reason": "credential missing capability"}
+    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: fake)
     monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
-    gate = _fake_gate(decision={"decision": "DENY", "decision_id": "d-9",
-                                "reason": "credential missing capability"})
-    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
     agentspp_authz._artifacts["shell"] = {
         "session": "s", "agent_did": "a", "vc": "v", "vp": "p", "capabilities": "c",
     }
@@ -259,12 +279,10 @@ def test_probe_records_denay_and_error(monkeypatch):
 
 
 def test_probe_survives_gate_exception(monkeypatch):
+    fake = FakeClient()
+    fake.decide_error = RuntimeError("unexpected")
+    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: fake)
     monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
-
-    def boom(client, mode, **kw):
-        raise RuntimeError("unexpected")
-
-    monkeypatch.setattr(pkg, "run_authorization_gate", boom)
     agentspp_authz._artifacts["shell"] = {
         "session": "s", "agent_did": "a", "vc": "v", "vp": "p", "capabilities": "c",
     }
@@ -274,25 +292,25 @@ def test_probe_survives_gate_exception(monkeypatch):
 
 
 def test_probe_shadow_runs_async_and_never_blocks(monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: fake)
     monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
-    gate = _fake_gate(decision={"decision": "ALLOW", "decision_id": "d-x"})
-    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
     agentspp_authz._artifacts["voice"] = {
         "session": "s", "agent_did": "a", "vc": "v", "vp": "p", "capabilities": "c",
     }
     t0 = time.monotonic()
     out = agentspp_authz.probe("g1_walk_forward", {"steps": 2}, "voice")
     assert out is None  # fire-and-forget
-    assert time.monotonic() - t0 < 0.2  # did not wait on the gate
-    # Wait for the daemon thread to FINISH (gate called AND log row landed in the
+    assert time.monotonic() - t0 < 0.2  # did not wait on the decide
+    # Wait for the daemon thread to FINISH (decide called AND log row landed in the
     # tmp DB). Ending earlier would let the thread write to the restored real DB.
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         authz_rows = [r for r in _rows(agent_log.DB) if r[1] == "authz"]
-        if gate.calls and authz_rows:
+        if fake.decides and authz_rows:
             break
         time.sleep(0.02)
-    assert gate.calls, "shadow probe thread never ran the gate"
+    assert fake.decides, "shadow probe thread never ran the decide"
     assert authz_rows, "shadow probe row never landed in the tmp agent_log"
     assert authz_rows[0][0] == "voice"
 
@@ -376,46 +394,53 @@ def test_mask_preserves_unitree_routing_args():
 # regression: VP nonce-replay (a presentation is single-use) + error meta
 # ─────────────────────────────────────────────────────────────────────────
 class _RaisingClient:
+    base_url = "fake-raise"
+
+    def __init__(self):
+        self.decides = []
+
     def build_presentation(self, *a, **k):
         raise RuntimeError("present down")
+
+    def authorize_action(self, *a, **k):
+        self.decides.append(k)
+        return {"decision": "allow", "decision_id": "d-2", "reason": None}
 
 
 def test_probe_mints_fresh_presentation_per_probe(monkeypatch):
     """Each probe must carry a NEW presentation (anti-replay nonce)."""
-    monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
-    gate = _fake_gate(decision={"decision": "allow", "decision_id": "d-1"})
-    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
     fake = FakeClient()
     monkeypatch.setattr(pkg, "default_client", lambda *a, **k: fake)
+    monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
     agentspp_authz._artifacts["shell"] = {
         "session": "s", "agent_did": "a", "vc": "v", "vp": "stale", "capabilities": "c",
     }
     agentspp_authz.probe("g1_turn", {}, "shell", blocking=True)
     agentspp_authz.probe("g1_turn", {}, "shell", blocking=True)
-    # gate saw the freshly minted presentation both times, never the stale one
-    assert all(c["vp"] == "vp.jwt" for c in gate.calls)
+    # the decide tool saw the freshly minted presentation both times, never the stale one
+    assert all(d["vp"] == "vp.jwt" for d in fake.decides)
     assert fake.pres == 2
 
 
 def test_probe_falls_back_to_bootstrap_vp_when_present_fails(monkeypatch):
+    client = _RaisingClient()
+    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: client)
     monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
-    gate = _fake_gate(decision={"decision": "allow", "decision_id": "d-2"})
-    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
-    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: _RaisingClient())
     agentspp_authz._artifacts["shell"] = {
         "session": "s", "agent_did": "a", "vc": "v", "vp": "bootstrap-vp", "capabilities": "c",
     }
     meta = agentspp_authz.probe("g1_turn", {}, "shell", blocking=True)
     assert meta["decision"] == "allow"
-    assert gate.calls[0]["vp"] == "bootstrap-vp"
+    # the decide ran on the bootstrap-time presentation (present had failed)
+    assert client.decides[0]["vp"] == "bootstrap-vp"
 
 
 def test_probe_captures_full_gate_error_message(monkeypatch):
-    """Gate exceptions surface as {'message': ...} — must not be dropped."""
+    """Tool/client exceptions surface as {'message': ...} — must not be dropped."""
+    fake = FakeClient()
+    fake.decide_error = RuntimeError("Agents++ request failed with status 400")
+    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: fake)
     monkeypatch.setenv("NEON_AUTHZ_MODE", "shadow")
-    gate = _fake_gate(error={"message": "Agents++ request failed with status 400"})
-    monkeypatch.setattr(pkg, "run_authorization_gate", gate)
-    monkeypatch.setattr(pkg, "default_client", lambda *a, **k: FakeClient())
     agentspp_authz._artifacts["shell"] = {
         "session": "s", "agent_did": "a", "vc": "v", "vp": "stale", "capabilities": "c",
     }

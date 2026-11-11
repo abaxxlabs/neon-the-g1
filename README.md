@@ -183,6 +183,16 @@ deprecated as an authorization boundary (the mcp credential seals it) and
 kept as a prompt-availability control, and the physical safety gates audited
 + tested (`tests/test_physical_safety.py`).
 
+**Strands tools surface (927).** Every Agents++ operation NEON performs —
+session/identity bootstrap, per-persona agent creation, credential issuance,
+presentations and the per-operation decision — goes through the package's
+`agents_*` Strands tools (`agents_create_session`, `agents_create_agent`,
+`agents_issue_credential`, `agents_build_presentation`,
+`agents_authorize_action`), never through the REST client directly. The
+tools are invoked programmatically by app code and are **never registered on
+the model's Agent**: a model that could call `agents_issue_credential` could
+issue itself a VC with arbitrary capabilities (self privilege-escalation).
+
 ## MCP server
 
 ```bash
