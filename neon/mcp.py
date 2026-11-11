@@ -68,7 +68,11 @@ def main() -> None:
     parser.add_argument("--stateless", action="store_true",
                         help="Stateless HTTP mode (multi-node scalable)")
     parser.add_argument("--safe", action="store_true",
-                        help="Drop locomotion/walking tools (state/arms/audio/sensing only)")
+                        help="DEPRECATED as authorization (ABXAGNTS-914): the mcp persona's "
+                             "Agents++ credential has no walk capability, so a remote client "
+                             "cannot walk the robot with or without this flag. Kept as a "
+                             "prompt-availability control (fewer tools for the remote model) "
+                             "and as the authz-off fallback (NEON_AUTHZ_MODE=off).")
     parser.add_argument("--no-telegram", action="store_true",
                         help="Exclude the telegram tool")
     parser.add_argument("--no-robot", action="store_true",
@@ -103,7 +107,12 @@ def main() -> None:
         persona="mcp",
     )
 
-    # --safe: strip the 🔴 locomotion tools so a remote client can't walk the robot.
+    # --safe: strip the 🔴 locomotion tools from the prompt. ABXAGNTS-914:
+    # deprecated as an authorization boundary — since 913 the mcp persona's
+    # credential carries no walk capability, so use_unitree RPCs that walk
+    # (SetVelocity, Move, g1_set_task_id, ...) are denied even without this
+    # flag. It remains a prompt-hygiene knob and the safety net for the
+    # authz-off rollback path.
     if args.safe:
         try:
             from tools import G1_LOCOMOTION_TOOLS
